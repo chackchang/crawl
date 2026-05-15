@@ -1,0 +1,260 @@
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import re
+import time
+import logging
+import urllib3
+from typing import List, Set, Optional
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+logger = logging.getLogger(__name__)
+
+
+class WebCrawler:
+    """Crawl a website to find titles and comments matching given keywords."""
+
+    COMMENT_SELECTORS = [
+        '[class*="comment"]', '[id*="comment"]',
+        '[class*="reply"]', '[id*="reply"]',
+        '[class*="discuss"]', '[class*="conversation"]',
+        '[class*="message"]', '[class*="chat"]',
+        '[class*="feedback"]', '[class*="review"]',
+        '.post-body', '.comment-body', '.comment-content',
+        '.comment-text', '.reply-content', '.user-message',
+        '[data-type="comment"]', '.chat-message',
+        'article.comment', 'li.comment', 'div.comment',
+    ]
+
+    TITLE_SELECTORS = [
+        '[class*="post-title"]', '[class*="entry-title"]',
+        '[class*="article-title"]', '[class*="thread-title"]',
+        '[class*="story-title"]', '[class*="headline"]',
+    ]
+
+    SKIP_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp',
+                       '.pdf', '.zip', '.rar', '.tar', '.gz', '.mp4', '.mp3',
+                       '.css', '.js', '.ico', '.woff', '.woff2', '.ttf', '.eot'}
+
+    SKIP_PATHS = {'login', 'logout', 'signup', 'signin', 'register',
+                  'cart', 'checkout', 'basket', 'account', 'admin'}
+
+    def __init__(self, max_depth=2, timeout=10, max_pages=30, delay=0.3):
+        self.max_depth = max_depth
+        self.timeout = timeout
+        self.max_pages = max_pages
+        self.delay = delay
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/125.0.0.0 Safari/537.36'
+            ),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        })
+        self.visited: Set[str] = set()
+        self.results: List[dict] = []
+        self.progress: dict = {'crawled': 0, 'status': 'idle', 'message': ''}
+
+    def crawl(self, url: str, keywords: List) -> List:
+        self.progress = {'crawled': 0, 'status': 'running', 'message': ''}
+        self.results = []
+        self.visited = set()
+
+        keywords = [k.strip().lower() for k in keywords if k.strip()]
+        if not keywords:
+            self.progress = {'crawled': 0, 'status': 'error',
+                             'message': '请输入至少一个关键词'}
+            return []
+
+        base_domain = urlparse(url).netloc or urlparse('//' + url).netloc
+        self.progress['message'] = f'开始爬取 {base_domain} ...'
+
+        try:
+            self._crawl_page(url, keywords, depth=0)
+            self.progress['status'] = 'completed'
+            self.progress['message'] = f'爬取完成，共找到 {len(self.results)} 条匹配结果'
+        except Exception as e:
+            logger.error(f"Crawl failed: {e}")
+            self.progress['status'] = 'error'
+            self.progress['message'] = f'爬取出错: {str(e)}'
+
+        # Sort by number of matched keywords (most relevant first)
+        self.results.sort(key=lambda r: len(r['matched_keywords']), reverse=True)
+        return self.results
+
+    def _crawl_page(self, url: str, keywords: List, depth: int) -> None:
+        if depth > self.max_depth:
+            return
+        if len(self.visited) >= self.max_pages:
+            return
+
+        normalized = self._normalize_url(url)
+        if normalized in self.visited:
+            return
+        self.visited.add(normalized)
+        self.progress['crawled'] = len(self.visited)
+        self.progress['message'] = f'正在爬取第 {len(self.visited)} 页...'
+
+        soup = self._fetch(url)
+        if soup is None:
+            return
+
+        # Extract and match titles
+        for item in self._extract_titles(soup, url):
+            matched = self._match(item['text'], keywords)
+            if matched:
+                self.results.append({
+                    'type': 'title',
+                    'text': item['text'][:300],
+                    'url': item['url'],
+                    'source_url': url,
+                    'matched_keywords': matched,
+                    'author': '',
+                })
+
+        # Extract and match comments
+        for item in self._extract_comments(soup, url):
+            matched = self._match(item['text'], keywords)
+            if matched:
+                self.results.append({
+                    'type': 'comment',
+                    'text': item['text'][:500],
+                    'url': item.get('url', url),
+                    'source_url': url,
+                    'matched_keywords': matched,
+                    'author': item.get('author', ''),
+                })
+
+        # Recurse into links
+        if depth < self.max_depth:
+            links = self._extract_links(soup, url)
+            for link in links[:8]:
+                if len(self.visited) >= self.max_pages:
+                    break
+                time.sleep(self.delay)
+                self._crawl_page(link, keywords, depth + 1)
+
+    def _fetch(self, url: str) -> Optional[BeautifulSoup]:
+        try:
+            resp = self.session.get(url, timeout=self.timeout,
+                                    verify=False, allow_redirects=True)
+            resp.raise_for_status()
+            ct = resp.headers.get('content-type', '').lower()
+            if 'text/html' not in ct and 'application/xhtml' not in ct:
+                return None
+            resp.encoding = resp.apparent_encoding or 'utf-8'
+            return BeautifulSoup(resp.text, 'lxml')
+        except requests.RequestException as e:
+            logger.debug(f"Fetch failed {url}: {e}")
+            return None
+        except Exception as e:
+            logger.debug(f"Parse failed {url}: {e}")
+            return None
+
+    def _extract_titles(self, soup: BeautifulSoup, base_url: str) -> List:
+        items: List[dict] = []
+        seen: Set[str] = set()
+
+        # h1-h6 headings
+        for tag in soup.find_all(['h1', 'h2', 'h3', 'h4']):
+            text = tag.get_text(strip=True)
+            if not text or len(text) < 4 or text in seen:
+                continue
+            seen.add(text)
+            link = tag.find('a')
+            url = urljoin(base_url, link['href']) if (link and link.get('href')) else base_url
+            items.append({'text': text, 'url': url})
+
+        # Common title class patterns
+        for selector in self.TITLE_SELECTORS:
+            for elem in soup.select(selector):
+                link = elem if elem.name == 'a' else elem.find('a')
+                text = (link or elem).get_text(strip=True)
+                if not text or len(text) < 4 or text in seen:
+                    continue
+                seen.add(text)
+                url = urljoin(base_url, link['href']) if (link and link.get('href')) else base_url
+                items.append({'text': text, 'url': url})
+
+        # og:title
+        og = soup.find('meta', property='og:title')
+        if og and og.get('content'):
+            text = og['content'].strip()
+            if text and text not in seen:
+                items.append({'text': text, 'url': base_url})
+
+        return items
+
+    def _extract_comments(self, soup: BeautifulSoup, base_url: str) -> List:
+        items: List[dict] = []
+        seen: Set[str] = set()
+
+        for selector in self.COMMENT_SELECTORS:
+            try:
+                for elem in soup.select(selector):
+                    text = elem.get_text(strip=True)
+                    if not text or len(text) < 8 or text in seen:
+                        continue
+                    seen.add(text)
+
+                    author = ''
+                    for a_sel in ['[class*="author"]', '[class*="user"]',
+                                  '[class*="name"]', 'cite', '.username']:
+                        ae = elem.select_one(a_sel)
+                        if ae:
+                            author = ae.get_text(strip=True)
+                            break
+
+                    link = elem.find('a', href=True)
+                    url = urljoin(base_url, link['href']) if link else base_url
+
+                    items.append({'text': text, 'url': url, 'author': author})
+            except Exception:
+                continue
+
+        return items
+
+    def _extract_links(self, soup: BeautifulSoup, base_url: str) -> List:
+        links: List[str] = []
+        base_domain = urlparse(base_url).netloc
+
+        for a in soup.find_all('a', href=True):
+            href = a['href'].strip()
+            if href.startswith('#') or href.startswith('javascript:'):
+                continue
+            full = urljoin(base_url, href)
+            parsed = urlparse(full)
+
+            if parsed.netloc and parsed.netloc != base_domain:
+                continue
+            if any(full.lower().endswith(ext) for ext in self.SKIP_EXTENSIONS):
+                continue
+            if any(f'/{p}/' in full.lower() or f'/{p}' == full.lower().rstrip('/')
+                   or full.lower().endswith(f'/{p}') for p in self.SKIP_PATHS):
+                continue
+
+            normalized = self._normalize_url(full)
+            if normalized not in self.visited:
+                links.append(full)
+
+        return links
+
+    def _match(self, text: str, keywords: List) -> List:
+        text_lower = text.lower()
+        return [kw for kw in keywords if kw in text_lower]
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+
+    @staticmethod
+    def validate_url(url: str) -> str:
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            raise ValueError(f'无效的URL: {url}')
+        return url
